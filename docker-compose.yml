@@ -1,0 +1,41 @@
+services:
+  api:
+    environment:
+        - ARTIFACTS_DIR=/data/artifacts
+        - PUBLIC_BASE_URL=http://localhost:8080
+    volumes:
+        - ./artifacts:/data/artifacts
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2
+    ports: ["8080:8080"]
+    env_file: .env
+    depends_on: [db, redis]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: sh -c "celery -A app.workers.celery_app.celery worker --loglevel=INFO -Q default"
+    env_file: .env
+    depends_on: [db, redis]
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: agentic
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
