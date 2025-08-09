@@ -22,3 +22,10 @@ COPY . .
 
 # Default env (can be overridden by .env / compose)
 ENV PORT=8080
+
+# --- Office exports (added by office pack) ---
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    libreoffice-core libreoffice-writer libreoffice-impress libreoffice-calc \
+    fonts-dejavu fonts-liberation ghostscript pandoc \
+ && rm -rf /var/lib/apt/lists/*
+# --- end office exports ---

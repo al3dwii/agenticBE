@@ -40,3 +40,8 @@ opentelemetry-instrumentation-fastapi==0.48b0
 opentelemetry-instrumentation-redis==0.48b0
 opentelemetry-instrumentation-httpx==0.48b0
 opentelemetry-instrumentation-logging==0.48b0
+mammoth
+python-pptx
+pdfminer.six
+pymupdf
+requests
