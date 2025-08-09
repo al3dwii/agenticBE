@@ -5,6 +5,5 @@ router = APIRouter()
 
 @router.get("/v1/packs")
 def list_packs():
-    reg = get_registry()
-    # return a JSON-serializable structure
+    reg = get_registry()  # plain dict: { pack: { agent_name: callable } }
     return {pack: sorted(list(agents.keys())) for pack, agents in reg.items()}

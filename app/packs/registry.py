@@ -1,24 +1,27 @@
-# Backward-compatible registry that supports both:
-# - REGISTRY()                 (callable)
-# - REGISTRY.get(...)/[...]    (dict-like)
-# - get_registry()             (function returning the plain dict)
+"""
+Backward-compatible registry:
 
-def _build_registry():
-    reg = {}
-    # Only keep the Office pack to avoid old doc2deck import issues
+- REGISTRY           -> dict-like AND callable; returns {pack_name: register_fn}
+- REGISTRY.get(name) -> register function (callable) expected by existing code
+- get_registry()     -> materialized mapping { pack: { agent_name: callable } }
+"""
+
+def _register_map():
+    # Keep only the Office pack to avoid doc2deck import issues
     from .office import register as register_office
-    reg.update(register_office())
-    return reg
+    return {
+        "office": register_office,  # callable returning {"office": {...agents...}}
+    }
 
 class _RegistryProxy:
     def __init__(self):
-        self._map = _build_registry()
+        self._map = _register_map()  # { pack: register_fn }
 
-    # allow REGISTRY() usage
+    # allow REGISTRY() usage to get the {pack: register_fn} mapping
     def __call__(self):
         return self._map
 
-    # dict-like helpers
+    # dict-like
     def get(self, *args, **kwargs): return self._map.get(*args, **kwargs)
     def __getitem__(self, k): return self._map[k]
     def __iter__(self): return iter(self._map)
@@ -27,16 +30,15 @@ class _RegistryProxy:
     def values(self): return self._map.values()
     def __contains__(self, k): return k in self._map
     def __len__(self): return len(self._map)
-
-    # convenience for debug/inspection
-    def list(self):
-        return {pack: sorted(agents.keys()) for pack, agents in self._map.items()}
-
-    def __repr__(self):
-        return f"REGISTRY({self._map!r})"
+    def __repr__(self): return f"REGISTRY(registers={list(self._map.keys())})"
 
 REGISTRY = _RegistryProxy()
 
 def get_registry():
-    # return the plain dict mapping
-    return REGISTRY()
+    """
+    Build the final { pack: { agent_name: callable } } by invoking each register().
+    """
+    out = {}
+    for reg_fn in REGISTRY.values():
+        out.update(reg_fn())
+    return out
