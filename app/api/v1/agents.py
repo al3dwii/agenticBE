@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.core.auth import get_tenant
 from app.core.rate_limit import check_rate_limit
 from app.memory.redis import get_redis
-from app.packs.registry import REGISTRY
+from app.packs.registry import get_registry
 
 router = APIRouter()
 
@@ -12,7 +12,7 @@ async def run_agent(pack: str, agent: str, payload: dict, tenant=Depends(get_ten
 
     # 1) resolve builder from registry
     try:
-        builder = REGISTRY.get(pack, agent)
+        builder = get_registry().get(pack, agent)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=f"Unknown agent '{pack}.{agent}': {e}")
     except Exception as e:
@@ -41,7 +41,7 @@ async def run_agent(pack: str, agent: str, payload: dict, tenant=Depends(get_ten
 # from app.memory.redis import get_redis
 
 # # 🔁 NEW: use the central registry instead of importer.load_agent
-# from app.packs.registry import REGISTRY
+# from app.packs.registry import get_registry
 
 # router = APIRouter()
 
@@ -51,7 +51,7 @@ async def run_agent(pack: str, agent: str, payload: dict, tenant=Depends(get_ten
 
 #     # Resolve the agent builder from the registry
 #     try:
-#         builder = REGISTRY.get(pack, agent)  # e.g. ("doc2deck","converter")
+#         builder = get_registry().get(pack, agent)  # e.g. ("doc2deck","converter")
 #     except KeyError as e:
 #         raise HTTPException(status_code=404, detail=str(e))
 
