@@ -16,7 +16,6 @@ import mimetypes
 import requests
 import mammoth
 from pptx import Presentation
-from pptx.util import Inches, Pt
 
 # Prefer PyMuPDF for PDF text (faster, better); fall back to pdfminer.
 try:
@@ -26,6 +25,25 @@ except Exception:
     _HAVE_FITZ = False
     from pdfminer.high_level import extract_text
 
+# ---------- Config ----------
+
+MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", 25 * 1024 * 1024))  # 25 MB
+ALLOWED_MIME = set(
+    filter(
+        None,
+        os.getenv(
+            "ALLOWED_FETCH_MIME",
+            ",".join(
+                [
+                    "application/pdf",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                ]
+            ),
+        ).split(","),
+    )
+)
+SOFFICE_BIN = os.getenv("SOFFICE_BIN", "soffice")
 
 # ---------- General Helpers ----------
 
@@ -47,36 +65,63 @@ def _guess_suffix(url: str, content_type: Optional[str]) -> str:
 def _ensure_dir(p: Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
 
+def _is_allowed_url(url: str) -> bool:
+    p = urlparse(url)
+    return p.scheme in ("http", "https")
 
 # ---------- Download / Inputs ----------
 
 def fetch_to_tmp(inputs: Dict[str, Any]) -> str:
     """
     Accepts one of:
-      - inputs["file_url"] or ["source_url"]
+      - inputs["file_url"] or ["source_url"] (http/https)
       - inputs["file_path"] (already local)
     Returns a local temp file path.
     """
     url = inputs.get("file_url") or inputs.get("source_url")
     if url:
+        if not _is_allowed_url(url):
+            raise ValueError("Only http(s) URLs are allowed")
+
         headers = {
             "User-Agent": os.getenv(
                 "FETCH_USER_AGENT",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
+                "agenticBE/1.0 (+https://example.com)",
             ),
             "Accept": "*/*",
         }
         try:
             with requests.get(url, headers=headers, stream=True, timeout=60, allow_redirects=True) as r:
                 r.raise_for_status()
-                suffix = _guess_suffix(url, r.headers.get("content-type"))
+                ctype = (r.headers.get("content-type") or "").split(";")[0].strip()
+                if ALLOWED_MIME and ctype and ctype not in ALLOWED_MIME:
+                    raise RuntimeError(f"Unsupported content-type: {ctype}")
+
+                # Pre-check size if Content-Length present
+                clen = r.headers.get("content-length")
+                if clen and int(clen) > MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError("File too large")
+
+                suffix = _guess_suffix(url, ctype)
                 fd, tmp_path = tempfile.mkstemp(suffix=suffix or "")
-                with os.fdopen(fd, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
+                wrote = 0
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if not chunk:
+                                continue
+                            wrote += len(chunk)
+                            if wrote > MAX_DOWNLOAD_BYTES:
+                                raise RuntimeError("File too large")
                             f.write(chunk)
+                except Exception:
+                    # Clean up partial file on error
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    raise
+
                 return tmp_path
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "unknown"
@@ -91,7 +136,6 @@ def fetch_to_tmp(inputs: Dict[str, Any]) -> str:
         return str(tmp)
 
     raise ValueError("Provide file_url/source_url or file_path.")
-
 
 # ---------- Outline Extraction ----------
 
@@ -171,7 +215,6 @@ def pptx_to_outline(pptx_path: str, max_slides: int = 50) -> List[Dict[str, Any]
             break
     return outline
 
-
 # ---------- PPTX Builder ----------
 
 def outline_to_pptx(outline: List[Dict[str, Any]], title: Optional[str] = None, dest_path: Optional[str] = None) -> str:
@@ -207,7 +250,6 @@ def outline_to_pptx(outline: List[Dict[str, Any]], title: Optional[str] = None, 
     prs.save(dest_path)
     return dest_path
 
-
 # ---------- LibreOffice Conversions ----------
 
 def soffice_convert(src_path: str, fmt: str, outdir: Optional[str] = None) -> str:
@@ -219,8 +261,14 @@ def soffice_convert(src_path: str, fmt: str, outdir: Optional[str] = None) -> st
     Returns path to the converted file (or top-level html if html export).
     """
     outdir = outdir or tempfile.mkdtemp()
-    cmd = ["soffice", "--headless", "--convert-to", fmt, "--outdir", outdir, src_path]
-    _run(cmd)
+    cmd = [SOFFICE_BIN, "--headless", "--convert-to", fmt, "--outdir", outdir, src_path]
+    try:
+        _run(cmd)
+    except FileNotFoundError:
+        raise RuntimeError("LibreOffice binary not found. Set $SOFFICE_BIN or install libreoffice.")
+    except RuntimeError as e:
+        # Bubble up with more context
+        raise RuntimeError(f"LibreOffice conversion failed: {e}") from e
 
     src = Path(src_path)
     if fmt == "html":
@@ -252,13 +300,12 @@ def zip_html_tree(html_path: str) -> str:
     shutil.make_archive(str(zip_path.with_suffix("")), "zip", root)
     return str(zip_path)
 
-
 # ---------- Artifact Saving ----------
 
 def save_artifact(local_path: str, dest_name: Optional[str] = None) -> Tuple[str, str]:
     """
     Copies local_path into ARTIFACTS_DIR and returns:
-      (absolute_dest_path, http_url)
+      (artifact_key, http_url)
     """
     try:
         from app.core.config import settings
@@ -277,9 +324,9 @@ def save_artifact(local_path: str, dest_name: Optional[str] = None) -> Tuple[str
         dest = artifacts_dir / f"{Path(name).stem}_{next(tempfile._get_candidate_names())}{Path(name).suffix}"
     shutil.copy2(local_path, dest)
 
-    url = f"{public_base.rstrip('/')}/artifacts/{dest.name}"
-    return str(dest), url
-
+    key = dest.name  # return only the filename, not server path
+    url = f"{public_base.rstrip('/')}/artifacts/{key}"
+    return key, url
 
 # ---------- Convenience wrappers agents use ----------
 
@@ -295,12 +342,25 @@ def pptx_to_pdf_file(pptx_path: str) -> str:
     return soffice_convert(pptx_path, "pdf")
 
 def pptx_to_docx_file(pptx_path: str) -> str:
-    return soffice_convert(pptx_path, "docx")
+    # Fallback: build a simple .docx from the PPTX outline (titles + bullets)
+    from docx import Document
+    outline = pptx_to_outline(pptx_path, max_slides=200)
+
+    doc = Document()
+    for slide in outline:
+        title = slide.get("title") or "Slide"
+        doc.add_heading(title, level=1)
+        for b in slide.get("bullets", []) or []:
+            doc.add_paragraph(str(b), style="List Bullet")
+
+    out = tempfile.mktemp(suffix=".docx")
+    _ensure_dir(Path(out))
+    doc.save(out)
+    return out
 
 def pptx_to_html5_zip(pptx_path: str) -> str:
     html = soffice_convert(pptx_path, "html")
     return zip_html_tree(html)
-
 
 __all__ = [
     # fetch
@@ -314,76 +374,3 @@ __all__ = [
     # artifacts
     "save_artifact",
 ]
-
-
-# import os, shutil, subprocess, tempfile
-# from pathlib import Path
-# from typing import List, Dict, Any
-# import urllib.request
-
-# import mammoth
-# from pdfminer.high_level import extract_text
-# from pptx import Presentation
-
-# def _run(cmd: List[str]):
-#     p = subprocess.run(cmd, capture_output=True, text=True)
-#     if p.returncode != 0:
-#         raise RuntimeError(f"{' '.join(cmd)}\n{p.stderr}")
-#     return p.stdout
-
-# def fetch_to_tmp(inputs: Dict[str, Any]) -> str:
-#     # Supports file_url | source_url | file_path
-#     url = inputs.get("file_url") or inputs.get("source_url")
-#     if url:
-#         fd, path = tempfile.mkstemp()
-#         os.close(fd)
-#         urllib.request.urlretrieve(url, path)
-#         return path
-#     if inputs.get("file_path") and os.path.exists(inputs["file_path"]):
-#         tmp = Path(tempfile.mkdtemp()) / Path(inputs["file_path"]).name
-#         shutil.copy2(inputs["file_path"], tmp)
-#         return str(tmp)
-#     raise ValueError("Provide file_url/source_url or file_path.")
-
-# def docx_to_outline(docx_path: str) -> List[Dict[str, Any]]:
-#     with open(docx_path, "rb") as f:
-#         html = mammoth.convert_to_html(f).value
-#     sections = [s.strip() for s in html.split("<h") if "</h" in s]
-#     outline = []
-#     for s in sections:
-#         title = s.split(">",1)[1].split("</h",1)[0].strip()
-#         bullets = []
-#         if "<li>" in s:
-#             bullets = [x.split("</li>",1)[0] for x in s.split("<li>")[1:]]
-#         outline.append({"title": title, "bullets": bullets[:6]})
-#     return outline[:24]
-
-# def pdf_to_outline(pdf_path: str) -> List[Dict[str, Any]]:
-#     text = extract_text(pdf_path) or ""
-#     chunks = [c.strip() for c in text.split("\n\n") if len(c.strip()) > 40]
-#     return [{"title": c.split("\n")[0][:80], "bullets": c.split("\n")[1:6]} for c in chunks[:20]]
-
-# def outline_to_pptx(outline: List[Dict[str, Any]], out_path: str, title: str = None):
-#     prs = Presentation()
-#     if title:
-#         slide = prs.slides.add_slide(prs.slide_layouts[0])
-#         slide.shapes.title.text = title
-#         slide.placeholders[1].text = ""
-#     for sec in outline:
-#         slide = prs.slides.add_slide(prs.slide_layouts[1])
-#         slide.shapes.title.text = sec.get("title","")[:120]
-#         tf = slide.placeholders[1].text_frame
-#         try:
-#             tf.clear()
-#         except Exception:
-#             pass
-#         for b in sec.get("bullets", [])[:12]:
-#             p = tf.add_paragraph(); p.text = str(b)[:200]; p.level = 0
-#     prs.save(out_path)
-#     return out_path
-
-# def soffice_convert(inp: str, fmt: str, outdir: str) -> str:
-#     Path(outdir).mkdir(parents=True, exist_ok=True)
-#     _run(["soffice","--headless","--convert-to",fmt,"--outdir",outdir,inp])
-#     base = Path(inp).with_suffix(f".{fmt.split(':')[0]}")
-#     return str(Path(outdir)/base.name)

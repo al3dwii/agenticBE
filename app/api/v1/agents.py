@@ -1,105 +1,90 @@
 from __future__ import annotations
 
+import os
 import inspect
-from fastapi import APIRouter, Depends, HTTPException, Body
+import asyncio
+from fastapi import APIRouter, Depends, HTTPException, Body, status
 
 from app.core.auth import get_tenant
 from app.core.rate_limit import check_rate_limit
 from app.memory.redis import get_redis
+
+# Prefer the direct resolver if available
+try:
+    from app.packs.registry import resolve_agent
+except Exception:
+    resolve_agent = None  # fallback to get_registry below
 from app.packs.registry import get_registry
 
 router = APIRouter()
 
+SYNC_AGENT_TIMEOUT_S = int(os.getenv("SYNC_AGENT_TIMEOUT_S", "60"))
+
+async def _exec_runner(runner, enriched: dict):
+    """
+    Execute a runner that may implement:
+      - async .arun(dict)
+      - .run(dict) -> maybe awaitable
+      - __call__(dict) -> maybe awaitable
+    """
+    if hasattr(runner, "arun") and inspect.iscoroutinefunction(runner.arun):
+        return await runner.arun(enriched)
+    if hasattr(runner, "run"):
+        maybe = runner.run(enriched)
+        return await maybe if inspect.isawaitable(maybe) else maybe
+    if callable(runner):
+        maybe = runner(enriched)
+        return await maybe if inspect.isawaitable(maybe) else maybe
+    raise TypeError("Runner is not callable")
 
 @router.post("/agents/{pack}/{agent}")
 async def run_agent(
     pack: str,
     agent: str,
-    payload: dict = Body(...),
-    tenant=Depends(get_tenant),
+    payload: dict = Body(default={}),
+    tenant = Depends(get_tenant),
 ):
-    # simple rate-limit hook
+    # Rate limit per-tenant/per-user
     await check_rate_limit(tenant.id, tenant.user_id)
 
-    # 1) resolve builder
-    reg = get_registry()  # { pack: { agent: builder } }
-    pack_map = reg.get(pack)
-    if not isinstance(pack_map, dict):
-        raise HTTPException(status_code=404, detail=f"Unknown pack '{pack}'")
+    # Resolve agent builder
+    try:
+        if resolve_agent:
+            builder = resolve_agent(pack, agent)  # raises KeyError if unknown
+        else:
+            reg = get_registry()  # { pack: { agent: builder } }
+            builder = reg.get(pack, {}).get(agent)
+            if not callable(builder):
+                raise KeyError(f"Unknown agent '{pack}.{agent}'")
+    except KeyError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e).strip("'"))
 
-    builder = pack_map.get(agent)
-    if not callable(builder):
-        raise HTTPException(status_code=404, detail=f"Unknown agent '{pack}.{agent}'")
-
-    # 2) build runner
+    # Build runner
     try:
         runner = builder(get_redis(), tenant.id)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Agent init error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Agent init error: {e}",
+        )
 
-    # 3) execute runner (prefer async .arun)
-    enriched = {**payload, "tenant_id": tenant.id, "job_id": payload.get("job_id", "ad-hoc")}
-
+    # Execute with timeout to avoid hangs
+    enriched = {**(payload or {}), "tenant_id": tenant.id, "job_id": payload.get("job_id", "ad-hoc")}
     try:
-        if hasattr(runner, "arun") and inspect.iscoroutinefunction(runner.arun):
-            result = await runner.arun(enriched)
-        elif hasattr(runner, "run"):
-            maybe = runner.run(enriched)
-            result = await maybe if inspect.iscoroutine(maybe) else maybe
-        elif callable(runner):
-            maybe = runner(enriched)
-            result = await maybe if inspect.iscoroutine(maybe) else maybe
-        else:
-            raise TypeError("Runner is not callable")
+        result = await asyncio.wait_for(_exec_runner(runner, enriched), timeout=SYNC_AGENT_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"Agent timed out after {SYNC_AGENT_TIMEOUT_S}s",
+        )
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Agent error: {e}")
+        # Keep it generic to avoid leaking internals
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Agent error: {e}",
+        )
 
-    # 4) return the dict produced by the agent
+    # Return whatever the agent produced (usually a dict)
     return result
-
-
-
-
-# from fastapi import APIRouter, Depends, HTTPException
-# from app.core.auth import get_tenant
-# from app.core.rate_limit import check_rate_limit
-# from app.memory.redis import get_redis
-
-# # 🔁 NEW: use the central registry instead of importer.load_agent
-# from app.packs.registry import get_registry
-
-# router = APIRouter()
-
-# @router.post("/agents/{pack}/{agent}")
-# async def run_agent(pack: str, agent: str, payload: dict, tenant=Depends(get_tenant)):
-#     await check_rate_limit(tenant.id, tenant.user_id)
-
-#     # Resolve the agent builder from the registry
-#     try:
-#         builder = get_registry().get(pack, agent)  # e.g. ("doc2deck","converter")
-#     except KeyError as e:
-#         raise HTTPException(status_code=404, detail=str(e))
-
-#     # Build the runner/loop for this tenant (pass redis if your builder needs it)
-#     runner = builder(get_redis(), tenant.id)
-
-#     # Normalize payload
-#     run_payload = {**payload, "tenant_id": tenant.id, "job_id": payload.get("job_id", "ad-hoc")}
-
-#     # Run with robust invocation (supports .arun, .run, or callable coroutine)
-#     try:
-#         if hasattr(runner, "arun"):
-#             result = await runner.arun(run_payload)
-#         elif hasattr(runner, "run"):
-#             maybe = runner.run(run_payload)
-#             result = await maybe if hasattr(maybe, "__await__") else maybe
-#         elif callable(runner):
-#             maybe = runner(run_payload)
-#             result = await maybe if hasattr(maybe, "__await__") else maybe
-#         else:
-#             raise TypeError("Agent builder returned an unsupported runner type")
-#         return {"result": result}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=f"Agent error: {e}")
